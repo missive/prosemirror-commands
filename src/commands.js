@@ -3,7 +3,7 @@ const {Slice, Fragment} = require("prosemirror-model")
 const {Selection, TextSelection, NodeSelection, extendTransformAction} = require("prosemirror-state")
 const {isExtendingCharAt} = require("extending-char")
 
-const {ios, mac} = require("./platform")
+const {mac} = require("./platform")
 const {charCategory} = require("./char")
 
 // :: (EditorState, ?(action: Action)) → bool
@@ -200,13 +200,30 @@ exports.lift = lift
 // [`code`](#model.NodeSpec.code) property in its spec, replace the
 // selection with a newline character.
 function newlineInCode(state, onAction) {
-  let {$from, $to, node} = state.selection
-  if (node) return false
-  if (!$from.parent.type.spec.code || $to.pos >= $from.end()) return false
+  let {$head, anchor} = state.selection
+  if (!$head || !$head.parent.type.spec.code || $head.sharedDepth(anchor) != $head.depth) return false
   if (onAction) onAction(state.tr.insertText("\n").scrollAction())
   return true
 }
 exports.newlineInCode = newlineInCode
+
+// :: (EditorState, ?(action: Action)) → bool
+// When the selection is in a node with a truthy
+// [`code`](#model.NodeSpec.code) property in its spec, create a
+// default block after the code block, and move the cursor there.
+function exitCode(state, onAction) {
+  let {$head, anchor} = state.selection
+  if (!$head || !$head.parent.type.spec.code || $head.sharedDepth(anchor) != $head.depth) return false
+  let above = $head.node(-1), after = $head.indexAfter(-1), type = above.defaultContentType(after)
+  if (!above.canReplaceWith(after, after, type)) return false
+  if (onAction) {
+    let pos = $head.after(), tr = state.tr.replaceWith(pos, pos, type.createAndFill())
+    tr.setSelection(Selection.near(tr.doc.resolve(pos), 1))
+    onAction(tr.scrollAction())
+  }
+  return true
+}
+exports.exitCode = exitCode
 
 // :: (EditorState, ?(action: Action)) → bool
 // If a block node is selected, create an empty paragraph before (if
@@ -297,16 +314,25 @@ function selectParentNode(state, onAction) {
 }
 exports.selectParentNode = selectParentNode
 
+function joinMaybeClear(state, $pos, onAction) {
+  let before = $pos.nodeBefore, after = $pos.nodeAfter, index = $pos.index()
+  if (!before || !after || !before.type.compatibleContent(after.type)) return false
+  if (!before.content.size && $pos.parent.canReplace(index - 1, index)) {
+    if (onAction) onAction(state.tr.delete($pos.pos - before.nodeSize, $pos.pos).scrollAction())
+    return true
+  }
+  if (!$pos.parent.canReplace(index, index + 1)) return false
+  if (onAction)
+    onAction(state.tr
+             .clearNonMatching($pos.pos, before.contentMatchAt(before.childCount))
+             .join($pos.pos)
+             .scrollAction())
+  return true
+}
+
 function deleteBarrier(state, cut, onAction) {
   let $cut = state.doc.resolve(cut), before = $cut.nodeBefore, after = $cut.nodeAfter, conn, match
-  if (canJoin(state.doc, cut)) {
-    if (onAction) {
-      let tr = state.tr.join(cut)
-      if (tr.steps.length && before.content.size == 0 && !before.sameMarkup(after) &&
-          $cut.parent.canReplace($cut.index() - 1, $cut.index()))
-        tr.setNodeType(cut - before.nodeSize, after.type, after.attrs)
-      onAction(tr.scrollAction())
-    }
+  if (joinMaybeClear(state, $cut, onAction)) {
     return true
   } else if (after.isTextblock && $cut.parent.canReplace($cut.index(), $cut.index() + 1) &&
              (conn = (match = before.contentMatchAt(before.childCount)).findWrappingFor(after)) &&
@@ -464,7 +490,7 @@ function setBlockType(nodeType, attrs) {
     if (onAction) {
       let where = $from.before(depth + 1)
       onAction(state.tr
-               .clearMarkupFor(where, nodeType, attrs)
+               .clearNonMatching(where, nodeType.contentExpr.start(attrs))
                .setNodeType(where, nodeType, attrs)
                .scrollAction())
     }
@@ -582,21 +608,23 @@ exports.chainCommands = chainCommands
 // are chained with [`chainCommands`](#commands.chainCommands):
 //
 // * **Enter** to `newlineInCode`, `createParagraphNear`, `liftEmptyBlock`, `splitBlock`
-// * **Backspace** to `deleteSelection`, `joinBackward`, `deleteCharBefore`
-// * **Mod-Backspace** to `deleteSelection`, `joinBackward`, `deleteWordBefore`
-// * **Delete** to `deleteSelection`, `joinForward`, `deleteCharAfter`
-// * **Mod-Delete** to `deleteSelection`, `joinForward`, `deleteWordAfter`
+// * **Mod-Enter** to `exitCode`
+// * **Backspace** to `deleteSelection`, `joinBackward`
+// * **Mod-Backspace** to `deleteSelection`, `joinBackward`
+// * **Delete** to `deleteSelection`, `joinForward`
+// * **Mod-Delete** to `deleteSelection`, `joinForward`
 // * **Alt-ArrowUp** to `joinUp`
 // * **Alt-ArrowDown** to `joinDown`
 // * **Mod-BracketLeft** to `lift`
 // * **Escape** to `selectParentNode`
 let baseKeymap = {
   "Enter": chainCommands(newlineInCode, createParagraphNear, liftEmptyBlock, splitBlock),
+  "Mod-Enter": exitCode,
 
-  "Backspace": ios ? chainCommands(deleteSelection, joinBackward) : chainCommands(deleteSelection, joinBackward, deleteCharBefore),
-  "Mod-Backspace": chainCommands(deleteSelection, joinBackward, deleteWordBefore),
-  "Delete": chainCommands(deleteSelection, joinForward, deleteCharAfter),
-  "Mod-Delete": chainCommands(deleteSelection, joinForward, deleteWordAfter),
+  "Backspace": chainCommands(deleteSelection, joinBackward),
+  "Mod-Backspace": chainCommands(deleteSelection, joinBackward),
+  "Delete": chainCommands(deleteSelection, joinForward),
+  "Mod-Delete": chainCommands(deleteSelection, joinForward),
 
   "Alt-ArrowUp": joinUp,
   "Alt-ArrowDown": joinDown,
